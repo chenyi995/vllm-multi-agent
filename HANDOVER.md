@@ -107,5 +107,5 @@ KV 池 = 显存×0.92 − 权重 8GB − 激活 ~1.5GB，÷ 144KB/token：
 5. **`sanity.log`** — 6 条 sanity（计划 §9）的执行结果，尤其 derope 误差数值与受限档 BlockRemoved 非空确认
 
 分析流程（任意 ≥8GB GPU 或纯 CPU 均可，不占推理卡）：
-de-RoPE 逆变换 → 按 token_ids 生成候选对 → cos ≥ 0.99 判定（K_post/K_derope/V 三视角，分层 + 严格口径）→ `counts.parquet` → 计划 §10 的 fig1–fig4。
+先用 sanity #6 的重算数据校准判定阈值 τ（cosine 分布 P1 分位，见计划 §4）→ de-RoPE 逆变换 → 按 token_ids 生成候选对 → cos ≥ τ 判定（K_post/K_derope/V 三视角，分层 + 严格口径）→ `counts.parquet` → 计划 §10 的 fig1–fig4。
 硬盘：充足档 dump 全量 ~90GB，预留 ≥120GB。

@@ -146,7 +146,7 @@ while frontier and budget:
 ### 判定"一样"
 
 - **候选对生成**：`BlockStored` 事件带每个 block 的 `token_ids`（`vllm/distributed/kv_events.py:50`）。只有 token 内容完全相同的 block 才进入数值比对（不同内容的 block 不视为可去重对象）。
-- **数值判定**：候选对逐 token 比 K（或 V）向量，block 内所有 token 的 cosine ≥ **0.99** 判为一样（**已定**）。附录给 {0.90, 0.95, 0.99, 0.999} 的阈值敏感性，主结果只用 0.99。
+- **数值判定**：候选对逐 token 比 K（或 V）向量（cosine = 归一化内积，BF16 转 FP32 计算），block 内所有 token 的 cosine ≥ **τ** 判为一样。**τ 由校准得出（已定，2026-08-03）**：取 sanity #6 重算保真度实验中"同内容同位置、驱逐后重算"block 对的 cosine 分布 **P1 分位数**——即浮点重算噪声的天然底线，判定口径为 "identical up to recomputation noise"。附录给 τ 与 {0.90, 0.95, 0.99, 0.999} 的阈值敏感性，主结果只用 τ。
 - **三个视角分别计数**：
   - `K_post`：cache 里原样的 post-RoPE K → 只有同内容**同位置**的 block 能一样
   - `K_derope`：逆旋转还原后的 K → 同内容**不同位置**的 block 也可能一样
@@ -168,6 +168,16 @@ Q1 核心数   N_dup[K_derope] - N_dup[K_post]
 
 - 同内容同位置的 block 对（vLLM 因 radix 分叉未合并、但前缀相同的场景）必须判为一样（接近逐位相等）→ 验证阈值不太严
 - 随机抽取的不同内容 block 对必须判为不一样 → 验证阈值不太松
+
+### 文献依据（2026-08-03 两轮核实，均有原文引句）
+
+- **度量先例**：KV 相似用 cosine/角距离有先例——MiniCache（NeurIPS'24，arXiv:2405.14366）以角距离 + SLERP 做跨层 KV 合并；KVMerger（arXiv:2407.08454）用 **key 状态 cosine ≥ 0.75** 识别序列内相邻可合并 token（其发现 value **无**局部相似性；与我们无冲突——我们比的是跨 block 同内容对，不是序列内相邻 token）。
+- **阈值先例**：没有任何论文把某个数值定义为"两段 KV 相同"。近似复用文献的阈值都远松于我们：KVMerger 0.75（合并）、SemShareKV（arXiv:2509.24832）LSH 0.8（跨 prompt 复用）、KVSharer（arXiv:2410.18517）输出表征 cosine 0.5。跨请求相似 block 的合并编码 Joint Encoding（arXiv:2601.03067，自适应 cosine 阈值）是与我们最接近的系统先例。
+- **存储去重先例**：现有系统全是 token 精确匹配、恒等保证（vLLM APC / SGLang radix / KVCache in the Wild 的 SipHash 块哈希，arXiv:2506.02634），无数值判定。我们"内容相同 + 数值容差"的口径介于精确匹配与近似复用之间，是文献空档。
+- **反面证据**：ContextPilot（arXiv:2511.03475）指出 KV 值相似度不是跨上下文可复用的可靠指标（近似匹配可损 9–11% 质量）。我们只在 token 内容**完全相同**的候选对内做数值判定，避开该批评。
+- **de-RoPE 先例**：KVLink（arXiv:2502.16002）存储时剥离 RoPE、推理拼接时按全局位置重加旋转（该步无需训练）——`K_derope` 的直接方法学先例。
+- **更正记录**：DroidSpeak（arXiv:2411.02820）选层依据是离线端到端质量画像（F1 的 Pareto 前沿），**不是**逐层 KV cosine，不作为 cosine 度量先例引用。
+- **阈值口径（已定）**：主阈值 τ 不取约定值，由 sanity #6 重算噪声底线校准（P1 分位数），比文献所有阈值都严格；0.99 等固定值仅作敏感性扫描点。
 
 ---
 
@@ -338,7 +348,7 @@ KV bytes/token = 2(K,V) × n_layers × n_kv_heads × head_dim × dtype_bytes
 3. 受限档 `BlockRemoved` 非空 ←— 否则容量档还要降
 4. `num_cached_tokens` 与事件流重建的 radix tree 命中一致
 5. T3 Fan-out 的 prefix hit ratio 接近理论上界（拓扑实现正确性反向验证）
-6. 重算保真度：单请求 dump → 人为挤出 → 重发 → 再 dump → 比对相对误差（支撑 §6.3 的 join 前提）
+6. 重算保真度：单请求 dump → 人为挤出 → 重发 → 再 dump → 比对相对误差（支撑 §6.3 的 join 前提）；其 cosine 分布的 P1 分位数即 §4 的判定阈值 τ——**本条必须在计数分析开始前完成**
 
 ---
 
@@ -354,7 +364,7 @@ analysis/
   fig1  9 workload × {K_post, K_derope, V} 的一样 block 占比（Q1 主图）
   fig2  一样 block 占比随 block size 4→64 的变化，9 workload 各一条线（Q2）
   fig3  受限档被驱逐 block 中"一样"block 的占比，按 workload（Q3）
-  fig4  阈值敏感性附录（{0.90, 0.95, 0.99, 0.999}）
+  fig4  阈值敏感性附录（τ 与 {0.90, 0.95, 0.99, 0.999}）
 ```
 
 ## 11. 执行顺序
@@ -391,6 +401,6 @@ analysis/
 
 **决策状态（全部已定）**：
 - ~~A~~ 已定：benchmark 按 §3 表格提议列执行
-- ~~B~~ 已定："一样"判定阈值 cos ≥ 0.99
+- ~~B~~ 已定（2026-08-03 更新）：主阈值 τ 由 sanity #6 重算噪声底线校准（P1 分位），0.99/0.999/0.95/0.90 为敏感性点
 - ~~C~~ 已定：受限容量档按 case 对齐相应论文数值，读 §12 后填 §6.2 映射表
 - ~~D~~ 已定：落盘路径 `/mnt/hdd_8t/kvpim-traces/`（3.9T 空闲、可写）
