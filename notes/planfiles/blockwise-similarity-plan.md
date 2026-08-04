@@ -2,7 +2,7 @@
 
 > 目标：在 9 类 multi-agent workload 中，统计**存储在 vLLM cache 里的全部 KV 中，有几个 block 是一样的**。
 > 覆盖三个维度的全叉积：① RoPE 编码前后、② block size {4, 8, 16, 32, 64}、③ 容量两档（受限 / 充足）。
-> 本文自包含（不依赖 KVPIM-README），标 ⚠️ 处待宸逸拍板。
+> 本文自包含（不依赖 KVPIM-README），全部决策已定。
 
 ---
 
@@ -146,7 +146,34 @@ while frontier and budget:
 ### 判定"一样"
 
 - **候选对生成**：`BlockStored` 事件带每个 block 的 `token_ids`（`vllm/distributed/kv_events.py:50`）。只有 token 内容完全相同的 block 才进入数值比对（不同内容的 block 不视为可去重对象）。
-- **数值判定**：候选对逐 token 比 K（或 V）向量（cosine = 归一化内积，BF16 转 FP32 计算），block 内所有 token 的 cosine ≥ **τ** 判为一样。**τ 由校准得出（已定，2026-08-03）**：取 sanity #6 重算保真度实验中"同内容同位置、驱逐后重算"block 对的 cosine 分布 **P1 分位数**——即浮点重算噪声的天然底线，判定口径为 "identical up to recomputation noise"。附录给 τ 与 {0.90, 0.95, 0.99, 0.999} 的阈值敏感性，主结果只用 τ。
+- **数值判定**：候选对逐 token 比 K（或 V）向量（cosine = 归一化内积，BF16 转 FP32 计算），block 内所有 token 的 cosine ≥ **τ** 判为一样。**τ 由校准得出，且逐层标定（已定，2026-08-03 实测后修订）**：取 sanity #6 重算保真度实验中"同内容同位置、重算后"block 对的 cosine 分布 **P1 分位数**，判定口径为 "identical up to recomputation noise"。
+
+**τ 是每个采样层一个值，不是全局一个值。** 实测噪声底线逐层累积（第 N 层的输入是第 N−1 层带误差的输出）：
+
+| 采样层 | 0 | 8 | 17 | 26 | 35 |
+|---|---|---|---|---|---|
+| τ（K_post，P1） | 0.99999 | 0.99998 | 0.97809 | 0.96400 | 0.99648 |
+
+跨度近三个数量级。若用全局单值（该实验的全局 P1 = 0.98054）：在 layer 26 上**过严**——那层真正相同的 block 有 >1% 会掉到阈值下被误判为"不一样"，N_dup 系统性低估；在 layer 0 上**过松**——那层噪声只到 1e-5，0.98 等于不设防。计划本就要求按采样层分别计数，逐层 τ 与之一致。
+
+**τ 必须在"部分前缀命中"条件下标定**（2026-08-03 实测的关键发现）：
+
+| 重算条件 | 结果 |
+|---|---|
+| A 完全驱逐 + 整条重新 prefill | 1050 对中 930 对**逐位相同**，cosine 精确 1.0 |
+| B 部分前缀命中、只重算后缀 | 1050 对中仅 144 对逐位相同，K_post P1 = 0.98054 |
+
+条件 A 之所以逐位复现：重算时 batch 形状与首次完全相同 → GPU 归约顺序相同 → 浮点结果逐位一致。噪声不是硬件的固有属性，**是 batch 形状的属性**。前缀缓存的常态是部分命中（后缀以更短的 batch 重新 prefill，归约顺序改变），故 τ 只能取自条件 B；按条件 A 标定会得出"噪声为零、τ = 1.0"的假结论。
+
+V 的重算噪声比 K 更大（条件 B 下 P1 = 0.96098，min 0.88306）。"V 是干净对照"仅对**位置无关性**成立，对**数值稳定性**不成立。
+
+当前 τ 取自单条 prompt × 7 个命中边界（1050 对），为工作值；正式跑批后须在真实 trace 上重标。
+
+**敏感性扫描点（2026-08-03 依实测修订）**：附录给 τ 与 **{0.99, 0.995, 0.999, 0.9999}** 的阈值敏感性，主结果只用 τ。
+原写的 {0.90, 0.95} 已删除——实测**不同内容**的 block 对 cosine 就已经是 K_post 0.90–0.96 / K_derope 0.90–0.96
+（V 仅 0.002–0.17），0.90/0.95 落在假阳性基线**之内**，用作阈值会把毫不相干的 block 判成"一样"。
+配套要求：每组结果必须同时报告"不同内容 block 对"的 cosine 分布作为**假阳性基线**，
+任何低于该基线 P99 的数值不得作为判定点。（该基线目前只有 5 block / 10 对的小样本，正式跑批后按真实数据复核。）
 - **三个视角分别计数**：
   - `K_post`：cache 里原样的 post-RoPE K → 只有同内容**同位置**的 block 能一样
   - `K_derope`：逆旋转还原后的 K → 同内容**不同位置**的 block 也可能一样
@@ -177,7 +204,10 @@ Q1 核心数   N_dup[K_derope] - N_dup[K_post]
 - **反面证据**：ContextPilot（arXiv:2511.03475）指出 KV 值相似度不是跨上下文可复用的可靠指标（近似匹配可损 9–11% 质量）。我们只在 token 内容**完全相同**的候选对内做数值判定，避开该批评。
 - **de-RoPE 先例**：KVLink（arXiv:2502.16002）存储时剥离 RoPE、推理拼接时按全局位置重加旋转（该步无需训练）——`K_derope` 的直接方法学先例。
 - **更正记录**：DroidSpeak（arXiv:2411.02820）选层依据是离线端到端质量画像（F1 的 Pareto 前沿），**不是**逐层 KV cosine，不作为 cosine 度量先例引用。
-- **阈值口径（已定）**：主阈值 τ 不取约定值，由 sanity #6 重算噪声底线校准（P1 分位数），比文献所有阈值都严格；0.99 等固定值仅作敏感性扫描点。
+- **阈值口径（已定）**：主阈值 τ 不取约定值，由 sanity #6 重算噪声底线校准（P1 分位数），比文献所有阈值都严格；
+  {0.99, 0.995, 0.999, 0.9999} 仅作敏感性扫描点（2026-08-03 依实测上调，见 §4）。
+  文献里 KVMerger 0.75 / SemShareKV 0.8 / KVSharer 0.5 这些阈值，按本实验实测的假阳性基线（不同内容 K 对已达 0.90+）
+  在我们的口径下全部不可用——这不是否定它们，而是因为它们做的是"近似复用"，我们做的是"是否同一"。
 
 ---
 
@@ -223,7 +253,23 @@ Q1 核心数   N_dup[K_derope] - N_dup[K_post]
 执行顺序：T1/T2/T3（30 组）→ T7/T8/T9（30 组）→ T4/T5/T6（30 组）
 ```
 
-固定量：Qwen3-4B BF16、`temperature=0`、`--kv-cache-dtype auto`（绝不 fp8）、单 vLLM 实例、锁定本仓库 commit。每组配置开始前 `reset_prefix_cache()`。
+固定量：Qwen3-4B BF16、`temperature=0`、`--kv-cache-dtype auto`（绝不 fp8）、单 vLLM 实例、锁定本仓库 commit。每个 workflow 开始前 `reset_prefix_cache()`（见 §6.2）。
+
+**`max_tokens=1024`、`gpu_memory_utilization=0.95`（2026-08-03 定）**：实测池子 **102,048 token**。
+两个参数一起，是为了让**充足档与受限档跑在同一种卡上**（A5000）：
+
+- MoA 原文的 `max_tokens=2048` 几乎不生效（实测输出 291–1365），但会让单 workflow 涨到 13.5 万 token，
+  24GB 卡装不下。1024 只截尾部，W 落在 9.2 万左右。
+- `0.95` 比常用的 `0.90` 多约 9% 池子（93,424 → 102,048），给上面这个 9.2 万留出约 10% 余量。
+
+**为什么值得为此改参数**：原分工（充足档 L40S / 受限档 A5000）把**一条 GPU 架构边界埋进了 Q3 的推理链**——
+Q3 拿受限档的驱逐名单去 join 充足档算出的重复判定，而 sanity #6 的保真度只在**同一张 A5000 内部**测过，
+跨卡（Ampere sm_86 ↔ Ada sm_89，FlashAttention 的 tile 划分与 kernel 分发可能不同 → 归约顺序不同）**从未测量**。
+两档同卡则该变量直接消失。次要理由：L40S 仅 3 张且长期零可用，A5000 有 5 张空闲。
+
+⚠️ **须如实记录的混淆**：压短输出会让 reference 变短，而 persona + Aggregate-and-Synthesize 提示词是**固定长度**的，
+于是固定部分在 prompt 中的占比上升 → **重复率可能被人为抬高**。方向可判断，幅度未知。
+若日后拿到 L40S，应用 `max_tokens=2048` 复跑一组同配置作对照。
 
 ### 6.1 block size 五档的实现（实际硬件约束）
 
@@ -252,12 +298,38 @@ Q1 核心数   N_dup[K_derope] - N_dup[K_post]
 | Parrot (OSDI'24) | 非容量受限实验，无池设置 |
 | Preble (arXiv:2407.00023) | 无显式池；Toolbench 潜在前缀工作集 ~2900 万 token，远超单卡容量（比例 ~0.01 量级），属前缀调度场景 |
 
-**受限档定义（按文献对齐，⚠️ 待宸逸确认）**：采用 KVFlow 比例——**受限档容量 = 该 workload 工作集的 50%**：
+**受限档定义（按文献对齐，宸逸已确认 2026-08-03）**：采用 KVFlow 比例——**受限档容量 = 该 workload 工作集的 50%**：
 
 | 档 | 定义 | 数值 |
 |---|---|---|
-| 受限 | KVFlow 式：容量 = 工作集 × 0.5 | 每个 workload 先在充足档跑完，从事件流测出工作集 token 数 W（存储过的唯一 block × block_size），受限档 `num_gpu_blocks_override = 0.5 × W / block_size`。各 workload 数值不同、自动适配 |
-| 充足 | 不发生驱逐 | 5090 默认 profiled（~13 万 token），以 `BlockRemoved` 为空验证 |
+| 受限 | KVFlow 式：容量 = 工作集 × 0.5 | 每个 workload 先在充足档跑完，从事件流测出**单 workflow** 工作集 token 数 W，受限档 `num_gpu_blocks_override = 0.5 × mean(W) / block_size`。各 workload 数值不同、自动适配 |
+
+**用 mean 不用 max（2026-08-03 实测后定）**：W 在 workflow 之间波动很大，T1 实测
+`[8176, 3872, 7232, 7760, 7696, 23520, 8416, 6624, 5776, 6352]`——第 6 个是离群值（该题重试多轮），
+是均值 8,542 的 2.75 倍。若按 `0.5 × max` 得池子 11,760 token，**比其余 9 个 workflow 各自的整个工作集还大**，
+它们全程不受限，`BlockRemoved` 虽非空（sanity #3 技术上通过）但 Q3 实际只有 1/10 个 workflow 的数据支撑：
+
+| 规则 | 池子 | 真正受限的 workflow |
+|---|---|---|
+| `0.5 × max(W)` | 11,760 | 1 / 10 |
+| **`0.5 × mean(W)`（采用）** | **4,271** | **9 / 10** |
+| `0.5 × median(W)` | 3,464 | 10 / 10 |
+
+mean 对应"该 workload 典型的工作集"，与 §6.2 原文"该 workload 工作集的 50%"的单数措辞一致。
+| 充足 | **单个 workflow 内**不发生驱逐 | 每个 workflow 开始前 `reset_prefix_cache()`，以整轮 `BlockRemoved` 为空验证 |
+
+**W 是每个 workflow 一份，不是每组配置一份（2026-08-03 实测后修订）**：实测 T3 单 workflow 工作集在 **90,192 / 135,088 / 80,480 token** 之间（19 次调用；prompt 从 layer 0 的 50 token 涨到 aggregator 的 6,801 token）。一组配置 10 题、题目互不相同、跨 workflow 几乎无共享，累计约 **100 万 token**——L40S 只有 22 万、A5000 只有 9.3 万，原判据"整组不驱逐"在任何卡上都不成立。
+
+改为**每个 workflow 之间清场**。注意 **W 随题目波动很大（9 万–13.5 万），不是常数**：
+
+| 卡 | KV 池 | 能否承担充足档 |
+|---|---|---|
+| A5000 24G | 9.3 万 token | **不能**——实测 135,088 token 的 workflow 在 node4 上驱逐了 2,606 个 block，`ample_criterion_met=false` |
+| L40S 48G | 22 万 token | 能。19 次调用全部打满 `max_tokens=2048` 的**最坏情况**约 20.1 万 token，余量约 9% |
+
+即充足档仍然**只能跑 L40S**（与 athena 方案 §2 的分工一致）；改清场解决的是"整组 100 万"这个不可能，不是把充足档下放到 A5000。每组配置结束后必须查 `manifest.ample_criterion_met`，为 false 说明该组有 workflow 撑破了池子。
+
+**这不损失跨 workflow 的重复度信号**：本实验的判定是对 **dump 出来的 block 做离线比对**，不依赖 vLLM 是否在运行时把它们合并成同一物理块。清场后同内容在两个 workflow 里是两块独立的物理 block，正是要计数的重复对（dump 侧因此必须按 workflow 边界重置去重集合，否则会漏 dump）。真正损失的只有**跨 workflow 的前缀命中率**这一个量——T3 里它本来就接近 0。
 
 这也决定了运行次序依赖：**同一 workload 必须先跑充足档、后跑受限档**（受限档数值来自充足档实测）。
 
@@ -265,7 +337,8 @@ Q1 核心数   N_dup[K_derope] - N_dup[K_post]
 
 ### 6.3 两档容量各采什么
 
-- **充足档（45 组）**：dump KV 张量（采样层）+ 事件流 → 一样 block 计数的主结果（Q1/Q2 全部出自这里）
+- **充足档（45 组）**：事件流全采；**KV 张量只在 16/32/64 三档 dump（27 组）** → 一样 block 计数的主结果（Q1/Q2 全部出自这里）
+  - **4/8 档不 dump（2026-08-03 定）**：这两档的物理 block 就是 16 token（见 §6.1），KV 张量与 16 档是同一批数据，只有匹配粒度不同；按 §6.1 本来就要"在分析侧按 4/8-token 单元切分 dump"，所以直接复用 16 档张量离线切分。4/8 档照常跑、照常采事件流（W、命中率、驱逐全都还在），只是不落张量。存储从 740 GB 降到 444 GB，不损失任何分析能力。
 - **受限档（45 组）**：只采事件流（`BlockStored`/`BlockRemoved`）+ `num_cached_tokens`，不 dump——block 随时被踢、dump 时机不可控。与同配置充足档的计数结果按 block 内容 join：**被驱逐的 block 中有多少属于"一样"集合**（Q3）。join 的前提是 temperature=0 下同内容同前缀的 KV 可复现，由 sanity #6 保真度实验支撑。
 
 ---
@@ -325,9 +398,12 @@ KV bytes/token = 2(K,V) × n_layers × n_kv_heads × head_dim × dtype_bytes
 
 | 项 | 估算 | 小计 |
 |---|---|---|
-| 充足档 dump | 9 workload × 5 档 × ~10 万 token × 20KB ≈ 2GB × 45 | **~90 GB** |
+| ~~充足档 dump（原估）~~ | ~~9 × 5 档 × ~10 万 token × 20KB ≈ 2GB × 45~~ | ~~90 GB~~ |
+| 充足档 dump（2026-08-03 实测修订） | 实测 1.6 GB/workflow（80,480 token × 20KB）→ 16.5 GB/组 × **27 组**（只 16/32/64 档） | **~444 GB** |
 | 事件 jsonl（90 组） | | <2 GB |
-| 需要空闲盘 | | **≥120 GB** |
+| 需要空闲盘 | | **≥500 GB** |
+
+原估算低了 8 倍：把"每组配置 ~10 万 token"当成了工作集，实测是**每个 workflow** 8 万、每组 10 题合计 80 万。
 
 **落盘路径（已核实本服务器）**：`/mnt/hdd_8t`（7.3T 盘，3.9T 空闲，用户可写）→ 建议 `/mnt/hdd_8t/kvpim-traces/`。dump 是顺序写，HDD 带宽足够。备选 `/home`（414G 空闲）。`/mnt/ssd` 无写权限，`/eda` 只剩 23G，均不可用。
 
@@ -343,11 +419,41 @@ KV bytes/token = 2(K,V) × n_layers × n_kv_heads × head_dim × dtype_bytes
 
 ## 9. Sanity Check 清单（按序执行，不通过就停）
 
-1. `derope(k_post, pos) ≈ k_pre`，max abs err < 1e-2 ←— 最关键（hook 单独跑一次拿真 pre-RoPE K 验证）
+1. `derope(k_post, pos) ≈ k_pre`，判据 **`cos(k_rec, k_pre) > 1 − 1e-6`（逐 token 取最小值）** ←— 最关键
+   （在 `rotary_emb` 上挂 **pre-hook** 抓真 pre-RoPE K：vLLM 的旋转是原地操作，post-hook 拿到的已经被转过了）
+   - **判据为何不是绝对误差**（2026-08-03 实测，原写 `max abs err < 1e-2` 已作废）：K 有 attention-sink 式离群值，
+     实测 `|k_post|` 最大 314 而均值仅 2.35，BF16 存储下 1e-2 的绝对阈值物理上到不了。
+     佐证：用本仓库的 `rope()` 正变换去对 vLLM 自己的 `k_post`，误差同为 6.2e-2 量级——1e-2 比 vLLM 自身数值噪声还低。
+     且本实验的判定指标本来就是 cosine，绝对误差不是相关量。
+   - 实测值：cosine 0.9999999692（cos/sin 走 BF16，与 vLLM 一致）/ 0.9999999805（cos/sin 走 FP32）。
 2. 同内容同位置 block 对判定为"一样"（cos ≈ 1.0，验证 token 对齐与阈值）
 3. 受限档 `BlockRemoved` 非空 ←— 否则容量档还要降
 4. `num_cached_tokens` 与事件流重建的 radix tree 命中一致
-5. T3 Fan-out 的 prefix hit ratio 接近理论上界（拓扑实现正确性反向验证）
+5. **编排正确性验证（2026-08-03 重写）**。原判据"T3 Fan-out 的 prefix hit ratio 接近理论上界"**已作废**：
+   宸逸选定 6 个不同 system prompt 扮演 proposer 后，6 个 proposer 从第 0 个 token 就分叉，
+   实测命中率仅 6.6%——低命中率成了"正确"的表现，与"编排 bug 导致前缀断裂"读数相同，探针失灵。
+
+   这一条守的是整条推理链里**唯一一个外部效度环节**：其余 sanity 都在验"把跑出来的东西测准了"，
+   只有它验"跑出来的东西是对的"。而 vLLM 看不见拓扑（§2），让 T1 成为 T1、T9 成为 T9 的**只有编排代码**，
+   所以 fig1 的横轴物理上就是那九个 driver；编排出错不会报错，会变成一个看起来可发表的**结论**。
+
+   替代判据分两层（实现在 `kvpim/analyze.py`）：
+
+   - **Tier 1 —— 与论文自己的实现逐字节对齐**（真正非循环，参照系是原作者的代码）。
+     用 AST 从 `ref/` 里只取出目标函数编译执行（这些文件顶层 import 了未安装的 openai/requests，不能整体导入）。
+     T3 实测：`_with_references` 与 `ref/MoA/utils.py::inject_references_to_messages` 在 6 个 proposer +
+     aggregator 共 7 个用例上**逐字节相等**。可同样处理的还有 Reflexion、Du et al. debate、CAMEL、ToT
+     （其 prompt 模板在 repo 中有逐字原文）；T2/T5/T6 的编排耦合在框架里，只能退到 Tier 2。
+   - **Tier 2 —— token 级结构不变量**（覆盖全部 9 个拓扑）。断言从拓扑定义写出，不从 driver 抄。
+     T3 的六条：persona 前缀正确、layer 0 无注入、同层 user turn 逐 token 相同、同层注入段相同、
+     AGG 提示词逐字出现、aggregator 不含任何 persona。
+
+   **判据本身必须能失败**：植入五个 bug（user turn 混入 agent 编号、references 顺序 per-agent 不同、
+   persona 错配、aggregator 带 persona、layer 0 误注入）后逐一验证，**五个全部被对应不变量抓到**；
+   Tier 1 把 references 编号从 1-based 改成 0-based 也立即失败。
+
+   **覆盖边界（如实说明）**：这套判据防的是**意外与回归**，防不住**理解偏差**——若对拓扑的理解本身就错，
+   Tier 2 的断言会跟着错。防理解偏差只有 Tier 1 的逐字节对齐和人工 review 两条路。原判据同样防不住。
 6. 重算保真度：单请求 dump → 人为挤出 → 重发 → 再 dump → 比对相对误差（支撑 §6.3 的 join 前提）；其 cosine 分布的 P1 分位数即 §4 的判定阈值 τ——**本条必须在计数分析开始前完成**
 
 ---
