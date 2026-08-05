@@ -106,12 +106,24 @@ def _git_commit() -> str:
     ).stdout.strip()
 
 
-def _tokenize(tokenizer, messages: list[dict]) -> list[int]:
-    """Applies the chat template and returns a flat list of token ids.
+def _tokenize(tokenizer, messages: list[dict], raw_completion: bool = False) -> list[int]:
+    """Turns a call's messages into the token ids the engine will receive.
 
     transformers 5.x returns a `BatchEncoding` from `apply_chat_template`;
     older versions returned the id list directly.
+
+    Args:
+        tokenizer: The run's tokenizer.
+        messages: The call's chat messages.
+        raw_completion: Send the last message's text as a bare continuation
+            instead of wrapping it in the chat template. Few-shot prompts that
+            were written for completion models (Tree of Thoughts) are answered
+            conversationally by an instruct model once the template frames them
+            as a question, which destroys the format the parser depends on.
     """
+    if raw_completion:
+        text = messages[-1]["content"]
+        return list(tokenizer(text, add_special_tokens=False)["input_ids"])
     encoded = tokenizer.apply_chat_template(
         messages, add_generation_prompt=True, tokenize=True
     )
@@ -279,13 +291,24 @@ def run(
                 call.workflow_id = workflow_id
                 call.call_idx = call_idx
 
-                prompt_token_ids = _tokenize(tokenizer, call.messages)
+                prompt_token_ids = _tokenize(
+                    tokenizer, call.messages, call.meta.get("raw_completion", False)
+                )
+                call_sampling = sampling
+                if call.meta.get("stop") or call.meta.get("max_tokens"):
+                    call_sampling = SamplingParams(
+                        temperature=0.0,
+                        top_p=1.0,
+                        top_k=0,
+                        max_tokens=call.meta.get("max_tokens", cfg.max_tokens),
+                        stop=call.meta.get("stop"),
+                    )
                 # Bracketing timestamps let the offline reconciliation replay the
                 # event stream up to the moment this call was admitted.
                 t_start = time.time()
                 output = llm.generate(
                     TokensPrompt(prompt_token_ids=prompt_token_ids),
-                    sampling,
+                    call_sampling,
                     use_tqdm=False,
                 )[0]
                 t_end = time.time()

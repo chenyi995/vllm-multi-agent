@@ -10,6 +10,15 @@ The paper samples the value three times at temperature 0.7; under this study's
 `temperature=0` those three samples would be identical, so the value is taken
 once (plan section 3).
 
+**These prompts are pure few-shot completions** — no instruction, just examples
+followed by `Input: {x}\nPossible next steps:\n` for the model to continue.
+Wrapping them in a chat template makes an instruct model answer the question
+instead of continuing the pattern ("Let's analyze the input: ... We are to find
+possible next steps — likely meaning ..."), which the parser cannot read, and
+the search terminates at its first node. They are therefore sent as raw
+continuations, which is how the paper used them. A stop sequence keeps the model
+from starting a fresh example of its own.
+
 Cache-wise this is the topology where siblings fan out from a shared path prefix
 and a backtrack re-activates an older one.
 """
@@ -81,8 +90,18 @@ VALUE_WEIGHTS = {"sure": 20.0, "likely": 1.0, "impossible": 0.001}
 BREADTH = 5
 DEPTH = 3
 MAX_CANDIDATES = 8
+# The prompt is a list of worked examples; without a stop the model happily
+# invents the next "Input:" block and keeps going.
+STOP = ["Input:", "Evaluate if given numbers"]
+# A completion model happily invents further worked examples after answering
+# ours — measured 21 of 24 value calls running to the 1024-token cap. The paper's
+# own examples are a handful of lines, so each call is bounded to that.
+PROPOSE_MAX_TOKENS = 256
+VALUE_MAX_TOKENS = 128
 
-_LEFT = re.compile(r"left:\s*([0-9.\s]+)\)")
+# Intermediate values can be negative; ToT's own get_current_numbers splits
+# on "left: " and strips the paren without filtering signs.
+_LEFT = re.compile(r"left:\s*([-0-9.\s]+)\)")
 
 
 def parse_candidates(reply: str, limit: int = MAX_CANDIDATES) -> list[tuple[str, str]]:
@@ -98,12 +117,16 @@ def parse_candidates(reply: str, limit: int = MAX_CANDIDATES) -> list[tuple[str,
 
 
 def score_value(reply: str) -> float:
-    """Maps the value reply onto ToT's sure/likely/impossible weights."""
-    tail = reply.strip().lower()
-    for name in ("impossible", "likely", "sure"):
-        if tail.endswith(name) or f"\n{name}" in tail:
-            return VALUE_WEIGHTS[name]
-    return VALUE_WEIGHTS["likely"] if "likely" in tail else VALUE_WEIGHTS["impossible"]
+    """Maps the value reply onto ToT's sure/likely/impossible weights.
+
+    Takes the *first* standalone verdict line: the model may carry on inventing
+    further examples after answering ours, and those carry their own verdicts.
+    """
+    for line in reply.strip().lower().splitlines():
+        word = line.strip()
+        if word in VALUE_WEIGHTS:
+            return VALUE_WEIGHTS[word]
+    return VALUE_WEIGHTS["impossible"]
 
 
 def build(
@@ -123,7 +146,8 @@ def build(
                     {"role": "user", "content": PROPOSE_PROMPT.format(input=numbers)}
                 ],
                 meta={"stage": "propose", "level": level, "node": node_idx,
-                      "numbers": numbers},
+                      "numbers": numbers, "raw_completion": True, "stop": STOP,
+                      "max_tokens": PROPOSE_MAX_TOKENS},
             )
             for step, remaining in parse_candidates(proposal):
                 verdict = yield Call(
@@ -136,7 +160,8 @@ def build(
                         }
                     ],
                     meta={"stage": "value", "level": level, "node": node_idx,
-                          "numbers": remaining},
+                          "numbers": remaining, "raw_completion": True,
+                          "stop": STOP, "max_tokens": VALUE_MAX_TOKENS},
                 )
                 scored.append((score_value(verdict), remaining, path + step + "\n"))
 
