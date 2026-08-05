@@ -15,6 +15,7 @@ which is exactly the population `N_total` counts.
 import ast
 import copy
 import json
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -359,13 +360,38 @@ def check_metagpt_reference() -> dict:
     }
 
 
-def load_reference_strings(rel_path: str, names: set[str]) -> dict[str, str]:
+def reference_source(rel_path: str, rev: str | None = None) -> str:
+    """Returns the text of a `ref/` file, optionally at a given git revision.
+
+    AutoGen's GroupChat was dropped in the 0.4 line that `ref/autogen` checks
+    out, so its prompts only exist under the v0.2.34 tag fetched into the same
+    clone.
+
+    Args:
+        rel_path: Path of the source file relative to `ref/`.
+        rev: Git revision to read from; the working tree when None. The
+            repository is taken to be the first path component.
+    """
+    if rev is None:
+        return (REF_ROOT / rel_path).read_text()
+    repo, _, inner = rel_path.partition("/")
+    return subprocess.run(
+        ["git", "-C", str(REF_ROOT / repo), "show", f"{rev}:{inner}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def load_reference_strings(
+    rel_path: str, names: set[str], rev: str | None = None
+) -> dict[str, str]:
     """Reads named string constants out of a `ref/` file without importing it.
 
     Handles both bare assignments and values wrapped in a single-argument call
-    such as CAMEL's `TextPrompt("...")`.
+    such as CAMEL's `TextPrompt("...")`, at module or class level.
     """
-    source = (REF_ROOT / rel_path).read_text()
+    source = reference_source(rel_path, rev)
     found: dict[str, str] = {}
 
     def record(target, value):
@@ -437,11 +463,142 @@ def check_tot_reference() -> dict:
     }
 
 
+def check_debate_reference() -> dict:
+    """Tier 1 for T4: match Du et al.'s own debate prompt assembly.
+
+    The reference keeps the round-0 question prompt inline in `__main__` rather
+    than in a constant, so it is checked by looking for our copy among the
+    source's string literals; the debate-round message is checked by running the
+    reference `construct_message` on synthetic contexts.
+    """
+    from kvpim.workloads.t4_debate import QUESTION_PROMPT, construct_message
+
+    rel_path = "llm_multiagent_debate/gsm/gen_gsm.py"
+    literals = {
+        node.value
+        for node in ast.walk(ast.parse(reference_source(rel_path)))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    cases = [
+        {
+            "case": "question_prompt",
+            "equal": QUESTION_PROMPT in literals,
+            "length": len(QUESTION_PROMPT),
+        }
+    ]
+
+    reference = load_reference_function(rel_path, "construct_message")
+    question = "Janet has 3 apples and eats 1. How many are left?"
+    replies = ["Two.\n\n\\boxed{2}", "```code``` \\boxed{2}"]
+    # `agents` is a list of per-agent conversations indexed at `idx`.
+    idx = 1
+    contexts = [[None, {"content": reply}] for reply in replies]
+    theirs = reference(contexts, question, idx)
+    ours = construct_message(replies, question)
+    cases.append(
+        {
+            "case": "debate_message",
+            "equal": theirs["role"] == "user" and theirs["content"] == ours,
+            "ours_len": len(ours),
+            "theirs_len": len(theirs["content"]),
+        }
+    )
+
+    return {
+        "check": "debate_prompts",
+        "reference": f"ref/{rel_path}",
+        "cases": cases,
+        "passed": all(c["equal"] for c in cases),
+    }
+
+
+def check_autogen_reference() -> dict:
+    """Tier 1 for T5: speaker-selection templates must match AutoGen 0.2.34."""
+    from kvpim.workloads.t5_groupchat import (
+        SELECT_SPEAKER_MESSAGE_TEMPLATE,
+        SELECT_SPEAKER_PROMPT_TEMPLATE,
+    )
+
+    rel_path = "autogen/autogen/agentchat/groupchat.py"
+    rev = "v0.2.34"
+    reference = load_reference_strings(
+        rel_path,
+        {"select_speaker_message_template", "select_speaker_prompt_template"},
+        rev=rev,
+    )
+    pairs = {
+        "select_speaker_message_template": SELECT_SPEAKER_MESSAGE_TEMPLATE,
+        "select_speaker_prompt_template": SELECT_SPEAKER_PROMPT_TEMPLATE,
+    }
+    cases = [
+        {"case": name, "equal": reference[name] == text, "length": len(text)}
+        for name, text in pairs.items()
+    ]
+    return {
+        "check": "autogen_speaker_selection",
+        "reference": f"ref/{rel_path}@{rev}",
+        "cases": cases,
+        "passed": all(c["equal"] for c in cases),
+    }
+
+
+def check_swarm_reference() -> dict:
+    """Tier 1 for T6: the one hand-copied agent instruction must match Swarm.
+
+    Four of the five agent prompts are read out of `ref/` at load time and are
+    reference-identical by construction; the Flight Modification agent's is
+    embedded in a `swarm.Agent(...)` call the driver cannot execute, so it was
+    copied and is the only one that can drift.
+    """
+    from kvpim.workloads.t6_handoff import load_agents
+
+    rel_path = "swarm/examples/airline/configs/agents.py"
+    instructions = None
+    for node in ast.walk(ast.parse(reference_source(rel_path))):
+        if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)):
+            continue
+        names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        if "flight_modification" not in names:
+            continue
+        for kw in node.value.keywords:
+            if kw.arg == "instructions" and isinstance(kw.value, ast.Constant):
+                instructions = kw.value.value
+    if instructions is None:
+        raise LookupError(f"flight_modification instructions not found in {rel_path}")
+
+    ours = load_agents()["flight_modification"]
+    return {
+        "check": "swarm_agent_instructions",
+        "reference": f"ref/{rel_path}",
+        "cases": [
+            {
+                "case": "flight_modification",
+                "equal": instructions == ours,
+                "ours_len": len(ours),
+                "theirs_len": len(instructions),
+            }
+        ],
+        "passed": instructions == ours,
+    }
+
+
 TIER1_CHECKS = {
     "T1": check_metagpt_reference,
     "T3": check_moa_reference,
+    "T4": check_debate_reference,
+    "T5": check_autogen_reference,
+    "T6": check_swarm_reference,
     "T8": check_camel_reference,
     "T9": check_tot_reference,
+}
+
+# The two topologies with no reference implementation to compare against, so
+# that an absent Tier 1 result reads as a recorded fact rather than an omission.
+TIER1_UNAVAILABLE = {
+    "T2": "GAIA supplies tasks, not an orchestrator; the prompts are ours "
+    "(plan section 3).",
+    "T7": "Reflexion's prompts are entangled with its framework; it exposes no "
+    "standalone constants.",
 }
 
 
@@ -575,13 +732,18 @@ def decode_calls(trace_dir: str | Path, tokenizer=None) -> tuple[dict, list[dict
         tokenizer = AutoTokenizer.from_pretrained(manifest["model"])
     decoded = []
     for call in read_jsonl(trace_dir / "calls.jsonl"):
-        turns = split_chat_turns(tokenizer.decode(call["prompt_token_ids"]))
+        text = tokenizer.decode(call["prompt_token_ids"])
+        turns = split_chat_turns(text)
+        # A raw-completion call carries no chat markers at all; the decoded text
+        # *is* the prompt.
         decoded.append(
             {
                 **call,
                 "turns": turns,
                 "system": turn_content(turns, "system"),
-                "user": turn_content(turns, "user", -1),
+                "user": turn_content(turns, "user", -1) if turns else text,
+                "output": tokenizer.decode(call["output_token_ids"]),
+                "is_raw": not turns,
             }
         )
     return manifest, decoded
@@ -644,6 +806,145 @@ def _check_t2(decoded: list[dict]) -> dict[str, list]:
     return bad
 
 
+def _check_t4(decoded: list[dict]) -> dict[str, list]:
+    """Debate: agents answer the same question alone, then read only the others.
+
+    The peer block is checked through the reference's own ```-fenced wrapper
+    rather than by substring, so a short reply that happens to occur inside
+    another cannot read as either a present peer or a leaked self.
+    """
+    from kvpim.workloads.t4_debate import NUM_AGENTS, NUM_ROUNDS
+
+    bad: dict[str, list] = {"call_count": [], "round0_prompt_identical": [],
+                            "context_monotonic": [], "peer_present": [],
+                            "self_excluded": [], "peer_order": [],
+                            "note_replies_identical": []}
+    for workflow_id, calls in _by_workflow(decoded).items():
+        if len(calls) != NUM_AGENTS * NUM_ROUNDS:
+            bad["call_count"].append(f"{workflow_id}: {len(calls)}")
+            continue
+        rounds = [calls[r * NUM_AGENTS : (r + 1) * NUM_AGENTS] for r in range(NUM_ROUNDS)]
+        # Round 0 is the independent pass: one question, no peer information.
+        if len({c["user"] for c in rounds[0]}) > 1:
+            bad["round0_prompt_identical"].append(workflow_id)
+        for index, (previous_round, current_round) in enumerate(zip(rounds, rounds[1:])):
+            # An agent's reply is read back off its own recorded conversation
+            # rather than from `output`, which still carries the end-of-turn
+            # marker that the orchestrator strips before quoting it.
+            replies = [
+                [c for role, c in call["turns"] if role == "assistant"][index]
+                for call in current_round
+            ]
+            if len(set(replies)) < len(replies):
+                bad["note_replies_identical"].append(f"{workflow_id} round{index}")
+            for agent, call in enumerate(current_round):
+                if not call["turns"][0][1].startswith(previous_round[agent]["turns"][0][1]):
+                    bad["context_monotonic"].append(_where(call))
+                positions = []
+                for peer, reply in enumerate(replies):
+                    fenced = f"```{reply}```"
+                    if peer == agent:
+                        # Undecidable when a peer said exactly the same thing.
+                        if fenced in call["user"] and replies.count(reply) == 1:
+                            bad["self_excluded"].append(_where(call))
+                        continue
+                    at = call["user"].find(fenced)
+                    if at < 0:
+                        bad["peer_present"].append(f"{_where(call)}: agent {peer}")
+                    else:
+                        positions.append(at)
+                if positions != sorted(positions):
+                    bad["peer_order"].append(_where(call))
+    return bad
+
+
+def _check_t5(decoded: list[dict]) -> dict[str, list]:
+    """Group chat: one broadcast transcript, a different system prompt in front.
+
+    The manager sees the same transcript as the speaker plus its own trailing
+    selection prompt — that identity is the topology, and it is what makes every
+    speaker's prefix fork at token zero.
+    """
+    from kvpim.workloads.t5_groupchat import (
+        AGENTS,
+        MAX_ROUND,
+        SELECT_SPEAKER_MESSAGE_TEMPLATE,
+        SELECT_SPEAKER_PROMPT_TEMPLATE,
+    )
+
+    agentlist = "[" + ", ".join(AGENTS) + "]"
+    selection_prompt = SELECT_SPEAKER_PROMPT_TEMPLATE.format(agentlist=agentlist)
+    head = SELECT_SPEAKER_MESSAGE_TEMPLATE.split("{roles}")[0]
+    bad: dict[str, list] = {"stage_alternates": [], "manager_system": [],
+                            "speaker_known": [], "speaker_system": [],
+                            "shared_transcript": [], "transcript_monotonic": [],
+                            "round_cap": []}
+    for workflow_id, calls in _by_workflow(decoded).items():
+        if len(calls) > 2 * MAX_ROUND:
+            bad["round_cap"].append(f"{workflow_id}: {len(calls)}")
+        for index, call in enumerate(calls):
+            expected = "select_speaker" if index % 2 == 0 else "speak"
+            if call["meta"]["stage"] != expected:
+                bad["stage_alternates"].append(_where(call))
+        for manager, speaker in zip(calls[::2], calls[1::2]):
+            if not (
+                manager["system"].startswith(head)
+                and agentlist in manager["system"]
+            ):
+                bad["manager_system"].append(_where(manager))
+            if speaker["agent_id"] not in AGENTS:
+                bad["speaker_known"].append(_where(speaker))
+            elif speaker["system"] != AGENTS[speaker["agent_id"]]:
+                bad["speaker_system"].append(_where(speaker))
+            manager_body = [c for role, c in manager["turns"] if role != "system"]
+            speaker_body = [c for role, c in speaker["turns"] if role != "system"]
+            if manager_body[-1:] != [selection_prompt]:
+                bad["manager_system"].append(_where(manager))
+            elif manager_body[:-1] != speaker_body:
+                bad["shared_transcript"].append(_where(speaker))
+        for previous, current in zip(calls[1::2], calls[3::2]):
+            previous_body = [c for role, c in previous["turns"] if role != "system"]
+            current_body = [c for role, c in current["turns"] if role != "system"]
+            if current_body[: len(previous_body)] != previous_body:
+                bad["transcript_monotonic"].append(_where(current))
+    return bad
+
+
+def _check_t6(decoded: list[dict]) -> dict[str, list]:
+    """Handoff: only the system prompt is swapped; the history is never trimmed.
+
+    The no-trim property is asserted specifically across the turns where the
+    agent changes, since that is the one place a framework would normally reset.
+    """
+    from kvpim.workloads.t6_handoff import HANDOFFS, MAX_TURNS, load_agents
+
+    agents = load_agents()
+    bad: dict[str, list] = {"stage_alternates": [], "agent_system": [],
+                            "legal_handoff": [], "history_monotonic": [],
+                            "no_trim_on_handoff": [], "turn_cap": []}
+    for workflow_id, calls in _by_workflow(decoded).items():
+        if len(calls) > MAX_TURNS:
+            bad["turn_cap"].append(f"{workflow_id}: {len(calls)}")
+        for index, call in enumerate(calls):
+            expected = "user" if index % 2 == 0 else "agent"
+            if call["meta"]["stage"] != expected:
+                bad["stage_alternates"].append(_where(call))
+        agent_calls = [c for c in calls if c["meta"]["stage"] == "agent"]
+        for call in agent_calls:
+            if call["system"] != agents.get(call["agent_id"]):
+                bad["agent_system"].append(_where(call))
+        for previous, current in zip(agent_calls, agent_calls[1:]):
+            source, target = previous["agent_id"], current["agent_id"]
+            if target != source and target not in HANDOFFS.get(source, set()):
+                bad["legal_handoff"].append(f"{_where(current)}: {source}->{target}")
+            previous_body = [c for role, c in previous["turns"] if role != "system"]
+            current_body = [c for role, c in current["turns"] if role != "system"]
+            if current_body[: len(previous_body)] != previous_body:
+                key = "no_trim_on_handoff" if target != source else "history_monotonic"
+                bad[key].append(_where(current))
+    return bad
+
+
 def _check_t7(decoded: list[dict]) -> dict[str, list]:
     """Reflexion: actor/evaluator alternate and memory keeps one reflection."""
     bad: dict[str, list] = {"stage_cycle": [], "memory_omega": []}
@@ -698,25 +999,54 @@ def _check_t8(decoded: list[dict]) -> dict[str, list]:
 
 def _check_t9(decoded: list[dict]) -> dict[str, list]:
     """Tree search: every prompt is the paper's template with only input filled."""
-    from kvpim.workloads.t9_tree_search import PROPOSE_PROMPT, VALUE_PROMPT
+    from kvpim.workloads.t9_tree_search import (
+        PROPOSE_PROMPT,
+        VALUE_PROMPT,
+        VALUE_WEIGHTS,
+        parse_candidates,
+    )
 
     templates = {
         "expander": PROPOSE_PROMPT.split("{input}"),
         "evaluator": VALUE_PROMPT.split("{input}"),
     }
-    bad: dict[str, list] = {"prompt_template": [], "no_system_turn": []}
+    bad: dict[str, list] = {"prompt_template": [], "raw_completion": [],
+                            "output_parseable": [], "note_value_no_verdict": []}
     for call in decoded:
-        if call["system"]:
-            bad["no_system_turn"].append(_where(call))
+        # ToT's prompts are few-shot completions; the chat template must not wrap
+        # them, or an instruct model answers the question instead of continuing
+        # the pattern and the parser reads nothing.
+        if not call["is_raw"]:
+            bad["raw_completion"].append(_where(call))
         head, tail = templates[call["agent_id"]]
-        if not (call["user"].startswith(head) and call["user"].endswith(tail.rstrip("\n"))):
+        # Trailing newlines are compared stripped on both sides: the propose
+        # template ends in one and the value template's tail *is* one, so a
+        # decoder that drops it must not read as a template mismatch.
+        prompt, tail = call["user"].rstrip("\n"), tail.rstrip("\n")
+        if not (prompt.startswith(head) and prompt.endswith(tail)):
             bad["prompt_template"].append(_where(call))
+        # A prompt in the right shape is not enough: an unreadable propose reply
+        # kills the branch, and the search silently stops at its first node.
+        # An unreadable *value* reply does not — ToT's own value_outputs_unwrap
+        # scores a reply with no verdict as 0 and carries on, so those are
+        # counted rather than treated as a violation.
+        if call["agent_id"] == "expander":
+            if not parse_candidates(call["output"]):
+                bad["output_parseable"].append(_where(call))
+        elif not any(
+            line.strip().lower() in VALUE_WEIGHTS
+            for line in call["output"].splitlines()
+        ):
+            bad["note_value_no_verdict"].append(_where(call))
     return bad
 
 
 TIER2_CHECKS = {
     "T1": _check_t1,
     "T2": _check_t2,
+    "T4": _check_t4,
+    "T5": _check_t5,
+    "T6": _check_t6,
     "T7": _check_t7,
     "T8": _check_t8,
     "T9": _check_t9,
@@ -733,13 +1063,18 @@ def check_structure(trace_dir: str | Path, tokenizer=None) -> dict:
     if checker is None:
         return {"check": "structure", "topology": topology, "passed": None,
                 "note": "no invariants defined"}
-    violations = checker(decoded)
+    found = checker(decoded)
+    # A `note_` key records something worth knowing that the reference
+    # implementation itself tolerates, so it is reported without failing.
+    violations = {k: v for k, v in found.items() if v and not k.startswith("note_")}
+    notes = {k[5:]: v for k, v in found.items() if v and k.startswith("note_")}
     return {
         "check": f"{topology.lower()}_structure",
         "trace_dir": str(trace_dir),
         "num_calls": len(decoded),
-        "violations": {k: v for k, v in violations.items() if v},
-        "passed": not any(violations.values()),
+        "violations": violations,
+        "notes": {k: len(v) for k, v in notes.items()},
+        "passed": not violations,
     }
 
 
@@ -786,12 +1121,16 @@ def index_dumped_blocks(trace_dir: str | Path) -> list[dict]:
 
 
 def _load_rows(path: Path, key: str, rows: list[int]):
-    """Reads specific block rows out of a safetensors file."""
+    """Reads specific block rows out of a safetensors file.
+
+    One open per call, not one per row: at the finest slicing a group can hold
+    thousands of units and the per-open cost dominates everything else.
+    """
     from safetensors import safe_open
 
     with safe_open(str(path), framework="pt") as handle:
         tensor = handle.get_slice(key)
-        return [tensor[row : row + 1][0] for row in rows]
+        return {row: tensor[row : row + 1][0] for row in rows}
 
 
 def _cosine_matrix(vectors) -> "object":
@@ -806,6 +1145,7 @@ def count_duplicates(
     trace_dir: str | Path,
     tau: dict[int, float] | None = None,
     thresholds: tuple[float, ...] = (0.99, 0.995, 0.999, 0.9999),
+    slice_to: int | None = None,
 ) -> dict:
     """Counts how many stored blocks duplicate another one.
 
@@ -813,6 +1153,14 @@ def count_duplicates(
         trace_dir: An ample-tier configuration directory holding `dumps/`.
         tau: Per-layer decision threshold; defaults to the sanity #6 calibration.
         thresholds: Extra fixed thresholds reported for the sensitivity appendix.
+        slice_to: Re-cut each dumped block into units of this many tokens before
+            counting. The 4 and 8 tiers run 16-token physical blocks and differ
+            only in matching granularity, so they carry no dump of their own;
+            the plan (section 6.1) answers them by re-cutting the 16 tier's
+            tensors. Same data, finer cut, which isolates granularity as the
+            only variable — note this is the 16 tier's token stream, which for
+            topologies whose control flow depends on generated text is not
+            byte-identical to what the 4 tier itself produced.
 
     Returns:
         Per-view, per-layer duplicate counts plus the strict cross-layer count
@@ -831,15 +1179,34 @@ def count_duplicates(
     content = {h: tuple(b["token_ids"]) for h, b in
                working_set_blocks(read_jsonl(trace_dir / "blocks.jsonl")).items()}
     blocks = index_dumped_blocks(trace_dir)
-    n_total = len(blocks)
+
+    # A "unit" is what gets counted: a whole dumped block, or one slice of it.
+    # `offset` says where inside the block's tensor rows the unit starts.
+    units = []
+    for block in blocks:
+        tokens = content.get(block["block_hash"])
+        if not tokens:
+            continue
+        span = min(len(tokens), len(block["positions"]))
+        step = slice_to or span
+        for start in range(0, span, step):
+            stop = min(start + step, span)
+            units.append(
+                {
+                    **block,
+                    "offset": start,
+                    "length": stop - start,
+                    "tokens": tokens[start:stop],
+                    "positions": block["positions"][start:stop],
+                }
+            )
+    n_total = len(units)
 
     # Only identical token content can be a duplicate, so the comparison set is
     # the groups with more than one member; singletons cost nothing.
     groups: dict[tuple, list[int]] = {}
-    for i, block in enumerate(blocks):
-        tokens = content.get(block["block_hash"])
-        if tokens:
-            groups.setdefault(tokens, []).append(i)
+    for i, unit in enumerate(units):
+        groups.setdefault(unit["tokens"], []).append(i)
     candidate_groups = [g for g in groups.values() if len(g) > 1]
 
     dup = {view: {layer: set() for layer in layers} for view in VIEWS}
@@ -855,16 +1222,29 @@ def count_duplicates(
         per_layer_hits = {view: [] for view in VIEWS}
         for layer in layers:
             vectors = {view: [] for view in VIEWS}
+            by_file: dict[Path, list[int]] = {}
             for index in members:
-                block = blocks[index]
-                path = block["dir"] / f"{block['call_idx']:04d}_{layer:02d}.safetensors"
-                k = _load_rows(path, "k", [block["row"]])[0].float()
-                v = _load_rows(path, "v", [block["row"]])[0].float()
-                span = len(block["positions"])
-                positions = torch.tensor(block["positions"])
-                vectors["K_post"].append(k[:span])
-                vectors["V"].append(v[:span])
-                vectors["K_derope"].append(derope(k[:span], positions, params))
+                unit = units[index]
+                path = unit["dir"] / f"{unit['call_idx']:04d}_{layer:02d}.safetensors"
+                by_file.setdefault(path, []).append(index)
+            loaded = {}
+            for path, indices in by_file.items():
+                rows = sorted({units[i]["row"] for i in indices})
+                loaded[path] = (
+                    _load_rows(path, "k", rows),
+                    _load_rows(path, "v", rows),
+                )
+            for index in members:
+                unit = units[index]
+                path = unit["dir"] / f"{unit['call_idx']:04d}_{layer:02d}.safetensors"
+                k_rows, v_rows = loaded[path]
+                k = k_rows[unit["row"]].float()
+                v = v_rows[unit["row"]].float()
+                lo, hi = unit["offset"], unit["offset"] + unit["length"]
+                positions = torch.tensor(unit["positions"])
+                vectors["K_post"].append(k[lo:hi])
+                vectors["V"].append(v[lo:hi])
+                vectors["K_derope"].append(derope(k[lo:hi], positions, params))
 
             for view in VIEWS:
                 similarity = _cosine_matrix(vectors[view])
@@ -894,7 +1274,8 @@ def count_duplicates(
     return {
         "trace_dir": str(trace_dir),
         "topology": manifest["topology"],
-        "block_tier": manifest["block_tier"],
+        "block_tier": slice_to or manifest["block_tier"],
+        "sliced_from": manifest["block_tier"] if slice_to else None,
         "capacity_tier": manifest["capacity_tier"],
         "n_total": n_total,
         "n_candidate_groups": len(candidate_groups),
@@ -1086,24 +1467,30 @@ def write_config_readme(trace_dir: str | Path, counts: dict | None = None) -> Pa
         lines = []
         s4 = sanity.get("sanity4") or {}
         if s4:
+            # `within_one_block` is the pre-two-mode name for `within_tolerance`.
+            tolerated = s4.get("within_tolerance", s4.get("within_one_block"))
+            mode = f"（{s4['mode']}）" if s4.get("mode") else ""
             lines.append(
-                f"- **#4 事件流对账**：{'PASS' if s4['passed'] else 'FAIL'} — "
+                f"- **#4 事件流对账**{mode}：{'PASS' if s4['passed'] else 'FAIL'} — "
                 f"{s4['exact_matches']}/{s4['num_calls']} 次调用精确一致，"
-                f"{s4['within_one_block']} 次在允许的一块误差内"
+                f"{tolerated} 次在容差内"
             )
         for key, label in (("sanity5_tier1", "#5 Tier 1（对论文原文逐字节）"),
                            ("sanity5_tier2", "#5 Tier 2（拓扑结构不变量）")):
             block = sanity.get(key)
             if not block:
-                lines.append(f"- **{label}**：不适用（该拓扑无可对照的原文实现）")
+                lines.append(f"- **{label}**：未记录")
+            elif block.get("reason"):
+                lines.append(f"- **{label}**：不适用 — {block['reason']}")
             elif block.get("passed") is None:
                 lines.append(f"- **{label}**：未定义不变量")
             else:
-                detail = (
-                    f"{len(block['cases'])} 个用例全部逐字节相等"
-                    if "cases" in block
-                    else f"违规 {block.get('violations') or '无'}"
-                )
+                if "cases" in block:
+                    detail = f"{len(block['cases'])} 个用例全部逐字节相等"
+                else:
+                    detail = f"违规 {block.get('violations') or '无'}"
+                    if block.get("notes"):
+                        detail += f"；已记录但不判失败 {block['notes']}"
                 lines.append(
                     f"- **{label}**：{'PASS' if block['passed'] else 'FAIL'} — {detail}"
                 )
