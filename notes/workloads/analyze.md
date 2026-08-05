@@ -105,11 +105,31 @@ load_reference_strings("camel/camel/prompts/ai_society.py", {"ASSISTANT_PROMPT",
 |---|---|---|
 | T1 | `ref/MetaGPT/metagpt/roles/role.py:51-52` 模板 + 五个角色的 goal/constraints | 五个角色全部逐字节相等 |
 | T3 | `ref/MoA/utils.py::inject_references_to_messages` | 7 个用例全部相等 |
+| T4 | `ref/llm_multiagent_debate/gsm/gen_gsm.py` 的字符串字面量 + `construct_message` | 2 个用例相等 |
+| T5 | `ref/autogen/.../groupchat.py@v0.2.34` 的两个选人模板 | 2 段相等 |
+| T6 | `ref/swarm/.../configs/agents.py` 里 `flight_modification` 的 instructions | 1 段相等 |
 | T8 | `ref/camel/.../ai_society.py` 的 ASSISTANT_PROMPT / USER_PROMPT | 2 段相等 |
 | T9 | `ref/tree-of-thought-llm/.../game24.py` 的 propose/value prompt | 2 段相等 |
 
-未覆盖：T2/T7（无原文可对照）、T4/T5（原文已取到但校验函数没写）、
-T6（运行时直接从 `ref/` 读，结构上等价但无独立校验）。
+三种取参照物的方式，按参照物在原仓库里的存在形态选：
+
+- **常量** → `load_reference_strings`（T5/T8/T9）。T5 的模板是 0.2.34 的
+  `GroupChat` 类字段，而 `ref/autogen` 检出的 0.4 分支已经删掉了 GroupChat，
+  所以用 `reference_source(..., rev="v0.2.34")` 走 `git show` 从同一个克隆的 tag 里读。
+- **函数** → `load_reference_function`（T3/T4）。喂合成输入，比对输出。
+- **埋在调用参数里** → 只能走 AST。T6 的 `flight_modification` 提示词写在
+  `swarm.Agent(instructions=...)` 里，driver 执行不了这个文件（要 import swarm），
+  所以从语法树上把那个 keyword 取出来比。
+
+**T4 的题面提示词没有常量可比**——原文把它内联在 `__main__` 的一行 f-string 里。
+所以判据是"我们这份出现在该文件的字符串字面量集合中"。这不如取常量精确
+（同文件另一处出现同样的串也会通过），但比不查强。
+
+未覆盖：**T2/T7**——两者的提示词都是自拟的（T2 是 GAIA 只给题不给编排，
+T7 是 Reflexion 的提示词和框架耦合、取不出独立常量）。
+这两类在 `TIER1_UNAVAILABLE` 里登记了原因，
+每组配置的 `sanity.log` 会写下"不适用 + 理由"，
+**而不是留空**——空值读起来像"忘了做"，和"做不了"是两回事。
 
 ### Tier 2：token 级结构不变量
 
