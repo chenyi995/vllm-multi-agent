@@ -1120,6 +1120,62 @@ def index_dumped_blocks(trace_dir: str | Path) -> list[dict]:
     return records
 
 
+def position_match_counts(trace_dir: str | Path, slice_to: int | None = None) -> dict:
+    """Counts how many stored units share content, and how many also share
+    the token indices that content sat at.
+
+    "Same content at the same indices" is the structural ceiling on what
+    post-RoPE K can match without any inverse transform: RoPE rotates by
+    position, so two units that agree on both see the same rotation. Everything
+    beyond it in the `K_derope` column had to be unlocked by removing the
+    rotation. Neither the tensors nor tau are involved, so this is exact rather
+    than threshold-dependent.
+
+    Args:
+        trace_dir: An ample-tier configuration directory holding `dumps/`.
+        slice_to: Re-cut blocks into units of this many tokens first, matching
+            `count_duplicates`.
+
+    Returns:
+        Totals and the two counts, plus their share of the stored units.
+    """
+    trace_dir = Path(trace_dir)
+    manifest = json.loads((trace_dir / "manifest.json").read_text())
+    content = {h: tuple(b["token_ids"]) for h, b in
+               working_set_blocks(read_jsonl(trace_dir / "blocks.jsonl")).items()}
+
+    by_content: dict[tuple, int] = {}
+    by_content_and_position: dict[tuple, int] = {}
+    n_total = 0
+    for block in index_dumped_blocks(trace_dir):
+        tokens = content.get(block["block_hash"])
+        if not tokens:
+            continue
+        span = min(len(tokens), len(block["positions"]))
+        step = slice_to or span
+        for start in range(0, span, step):
+            stop = min(start + step, span)
+            key = tokens[start:stop]
+            positions = tuple(block["positions"][start:stop])
+            n_total += 1
+            by_content[key] = by_content.get(key, 0) + 1
+            pair = (key, positions)
+            by_content_and_position[pair] = by_content_and_position.get(pair, 0) + 1
+
+    same_content = sum(n for n in by_content.values() if n > 1)
+    same_both = sum(n for n in by_content_and_position.values() if n > 1)
+    return {
+        "topology": manifest["topology"],
+        "block_tier": slice_to or manifest["block_tier"],
+        "capacity_tier": manifest["capacity_tier"],
+        "n_total": n_total,
+        "n_same_content": same_content,
+        "n_same_content_and_position": same_both,
+        "frac_same_content": same_content / n_total if n_total else 0.0,
+        "frac_same_content_and_position": same_both / n_total if n_total else 0.0,
+    }
+
+
 def _load_rows(path: Path, key: str, rows: list[int]):
     """Reads specific block rows out of a safetensors file.
 

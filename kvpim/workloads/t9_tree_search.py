@@ -19,8 +19,9 @@ the search terminates at its first node. They are therefore sent as raw
 continuations, which is how the paper used them. A stop sequence keeps the model
 from starting a fresh example of its own.
 
-Cache-wise this is the topology where siblings fan out from a shared path prefix
-and a backtrack re-activates an older one.
+Cache-wise this is the topology where one long fixed prefix — the few-shot
+examples — is resent on every call with only a few trailing tokens changing.
+The frontier is replaced wholesale at each level, so nothing is backtracked to.
 """
 
 import random
